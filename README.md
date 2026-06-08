@@ -121,6 +121,45 @@ If the robot E-stops, release it and re-enable:
 rosrun intera_interface enable_robot.py -e
 ```
 
+## Data collection (Basler + uSkin → tactile-ACT episodes)
+
+Recording is **built into the teleop node** (`test_ps2.py`): drive the arm with the
+gamepad, and capture synchronised sensor + robot state into `episode_*.hdf5` files in
+the **tactile_act_real** format.
+
+| Sensor | Package (in image) | Interface | HDF5 keys |
+|--------|--------------------|-----------|-----------|
+| Basler ×3 (GigE) | `pypylon` | by IP over `--net=host` | `image_left/right/top` (T,300,480,3) |
+| uSkin (2 fingers) | `websocket-client` → `xela_server` | SocketCAN → `ws://localhost:5000` | `tactile_1/2` (T,5,24,3) |
+| Intel RealSense *(off by default)* | `pyrealsense2` (not installed yet) | USB | `image_realsense` + `depth_realsense` |
+
+Plus `action_pos`, `action_quat`, `gripper`, `joint_state`, `timestamp`.
+
+**One-time:** the XELA server is proprietary — put `xela_server` + `xServ.ini` under
+`external/Xela/` before building (it gets installed to `/usr/local/bin` + `/etc/xela`).
+Basler capture works without it.
+
+**Host prep for tactile** (uSkin is on the CAN bus):
+```bash
+sudo ip link set can0 up type can bitrate 1000000
+```
+
+**Persist episodes to the host** — add to your `docker run`:
+```bash
+  -v $REPO_PATH/collected_data:/root/collected_data \
+```
+
+**Collect** — in terminal 2 (the same container), start the tactile server first, then
+run the teleop as usual:
+```bash
+xela_server -f /etc/xela/xServ.ini --port 5000 --ip 0.0.0.0 &   # only needed for uSkin
+python3 src/ps2_ik_teleop/scripts/test_ps2.py
+```
+Keys while teleoperating: **r** start episode · **f** finish + save · **d** discard ·
+**h** return to HOME. Episodes land in `/root/collected_data/`. Camera IPs / rate are
+ROS params (`~camera_ips`, `~record_rate`); `~record_realsense` enables RealSense
+(after `pip install pyrealsense2`).
+
 ## NOTE:
 
 if created container then dont recreate again in the future just, remember the container ID:
