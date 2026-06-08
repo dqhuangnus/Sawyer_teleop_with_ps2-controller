@@ -35,11 +35,27 @@ RUN apt-get update && apt-get install -y \
     ros-noetic-gazebo-ros \
     ros-noetic-gazebo-msgs \
     ros-noetic-joint-state-publisher \
+    python3-opencv \
     && rm -rf /var/lib/apt/lists/*
- 
-RUN python3 -m pip install "numpy==1.17.4" "pyRobotiqGripper==1.0.1"
 
-RUN python3 -m pip install pygame
+# focal's stock pip (20.0.2) doesn't understand the manylinux_2_28 tag on the
+# pypylon wheel — upgrade pip ONLY (NOT setuptools: a newer setuptools breaks
+# catkin's interrogate_setup_dot_py.py via the old importlib_metadata).
+RUN python3 -m pip install --upgrade pip
+
+# Python deps. numpy bumped to 1.24.4 (old 1.17.4 is incompatible with h5py).
+#   pygame           -> gamepad input
+#   pypylon          -> Basler GigE cameras (Basler cp38 wheel; rc not on PyPI)
+#   websocket-client -> uSkin tactile (xela_server @ ws://localhost:5000)
+#   h5py             -> episode recording   (cv2 from apt python3-opencv)
+# RealSense (pyrealsense2) intentionally not installed — capture off by default.
+RUN python3 -m pip install \
+        "numpy==1.24.4" \
+        "pyRobotiqGripper==1.0.1" \
+        "pygame" \
+        "https://github.com/basler/pypylon/releases/download/2.0.0rc1/pypylon-2.0.0rc1-cp38-cp38-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" \
+        "websocket-client==1.8.0" \
+        "h5py==3.11.0"
 
 # -----------------------------
 # 1.5 Rust toolchain (to build RelaxedIK)
@@ -101,6 +117,25 @@ COPY src/relaxed_ik_core /root/catkin_ws/src/relaxed_ik_core
 RUN cd /root/catkin_ws/src/relaxed_ik_core && cargo build --release
 
 COPY src/ps2_ik_teleop /root/catkin_ws/src/ps2_ik_teleop
+
+# -----------------------------
+# 6.6 XELA / uSkin tactile server (proprietary, supplied by user)
+# -----------------------------
+# uSkin websocket server (ws://localhost:5000) is vendor software, not in git.
+# Place the binary + config under ./external/Xela/ before building:
+#     external/Xela/xela_server -> /usr/local/bin/xela_server  (~57 MB)
+#     external/Xela/xServ.ini    -> /etc/xela/xServ.ini
+# Start at runtime:  xela_server -f /etc/xela/xServ.ini --port 5000 --ip 0.0.0.0
+# Build still succeeds without it — only tactile capture is unavailable.
+COPY external/Xela/ /tmp/xela/
+RUN if [ -f /tmp/xela/xela_server ]; then \
+        install -m 0755 /tmp/xela/xela_server /usr/local/bin/xela_server && \
+        mkdir -p /etc/xela && \
+        ([ -f /tmp/xela/xServ.ini ] && cp /tmp/xela/xServ.ini /etc/xela/xServ.ini || true) && \
+        echo "[build] XELA server installed"; \
+    else \
+        echo "[build] external/Xela/xela_server absent — tactile server not installed"; \
+    fi && rm -rf /tmp/xela
 
 # -----------------------------
 # 7. Build catkin workspace

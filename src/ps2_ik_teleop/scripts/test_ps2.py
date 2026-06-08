@@ -52,6 +52,15 @@ from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker
 import pygame
 
+# Data-collection helpers (live alongside this script in scripts/).
+# Degrade gracefully if capture deps (pypylon / websocket-client / h5py) absent.
+try:
+    from sensors import TactileReader, BaslerCameraManager
+    from data_recorder import DataRecorder
+    _RECORDING_AVAILABLE = True
+except Exception:
+    _RECORDING_AVAILABLE = False
+
 # ─── relaxedIK solver from directory ──────────────────────────────────────
 _RIK_ROOT     = '/root/catkin_ws/src/relaxed_ik_core'       # repository
 _RIK_WRAPPER  = _RIK_ROOT + '/wrappers/python_wrapper.py'   # Python bindings
@@ -414,6 +423,104 @@ class PS2TeleopVizNode:
         self._ori_yaw   = 0.0
         self._ori_mode  = 0   # 0 = yaw+Z (L1),  1 = roll+pitch (L2)
 
+        # ── Data collection (Basler ×3 + uSkin tactile) ───────────────────
+        self.record_enabled   = rospy.get_param('~record_enabled', True)
+        self.record_rate      = rospy.get_param('~record_rate', 20.0)
+        self.save_dir         = rospy.get_param('~save_dir', '/root/collected_data')
+        self.xela_ws_url      = rospy.get_param('~xela_ws_url', 'ws://localhost:5000')
+        self.n_taxels         = rospy.get_param('~tactile_taxels', 24)
+        self.tac_hist         = rospy.get_param('~tactile_history', 5)
+        self.camera_ips       = rospy.get_param('~camera_ips', {
+            'image_left':  '192.168.1.130',
+            'image_right': '192.168.1.120',
+            'image_top':   '192.168.1.100'})
+        self.cam_scale        = rospy.get_param('~camera_scale',   0.5)
+        self.cam_binning      = rospy.get_param('~camera_binning', 2)
+        self.cam_fps          = rospy.get_param('~camera_fps',     10)
+        self.record_realsense = rospy.get_param('~record_realsense', False)
+
+        self.recorder  = None
+        self.recording = False
+        self.ep_count  = 0
+        self._init_recording()
+
+    # ── Data collection: start sensors + build recorder ───────────────────
+    def _init_recording(self):
+        if not self.record_enabled:
+            rospy.loginfo("[ctrl] Recording disabled (record_enabled=false)")
+            return
+        if not _RECORDING_AVAILABLE:
+            rospy.logwarn("[ctrl] Recording deps missing (pypylon/websocket/h5py) — disabled")
+            return
+
+        self.tactile = None
+        try:
+            self.tactile = TactileReader(ws_url=self.xela_ws_url,
+                                         n_per_finger=self.n_taxels,
+                                         history_len=self.tac_hist)
+            self.tactile.start()
+            rospy.loginfo("[ctrl] Tactile reader started (%s)", self.xela_ws_url)
+        except Exception as e:
+            rospy.logwarn("[ctrl] Tactile unavailable: %s", e)
+
+        self.basler = None
+        try:
+            self.basler = BaslerCameraManager(self.camera_ips, scale=self.cam_scale,
+                                              binning=self.cam_binning, fps=self.cam_fps)
+            self.basler.start_bg()
+            rospy.loginfo("[ctrl] Basler cameras: %s", self.basler.names)
+        except Exception as e:
+            rospy.logwarn("[ctrl] Basler cameras unavailable: %s", e)
+
+        self.realsense = None
+        if self.record_realsense:
+            try:
+                from realsense_camera import RealSenseCamera
+                self.realsense = RealSenseCamera()
+                self.realsense.start_bg()
+                rospy.loginfo("[ctrl] RealSense started")
+            except Exception as e:
+                rospy.logwarn("[ctrl] RealSense unavailable: %s", e)
+
+        gripper = self._gripper if getattr(self, '_gripper_ready', False) else None
+        self.recorder = DataRecorder(
+            limb=self._limb, gripper=gripper, tactile=self.tactile,
+            basler=self.basler, realsense=self.realsense,
+            rate_hz=self.record_rate, save_dir=self.save_dir)
+        rospy.loginfo("[ctrl] Recorder ready -> %s  (r=record  f=finish+save  d=discard)",
+                      self.save_dir)
+
+    def _handle_record_key(self, key):
+        if self.recorder is None:
+            rospy.logwarn_throttle(2.0, "[ctrl] recording not available")
+            return
+        if key == 'r' and not self.recording:
+            self.recorder.start()
+            self.recording = True
+            rospy.loginfo("[ctrl] >>> RECORDING episode")
+        elif key == 'f' and self.recording:
+            self.recorder.stop()
+            self.recording = False
+            path = self.recorder.save(tag="ep%03d" % self.ep_count)
+            if path:
+                self.ep_count += 1
+            rospy.loginfo("[ctrl] <<< saved %d frames", len(self.recorder))
+        elif key == 'd' and self.recording:
+            self.recorder.stop()
+            self.recording = False
+            rospy.loginfo("[ctrl] episode discarded")
+
+    def _shutdown_recording(self):
+        if self.recording and self.recorder is not None:
+            self.recorder.stop()
+        for obj in (getattr(self, 'tactile', None), getattr(self, 'basler', None),
+                    getattr(self, 'realsense', None)):
+            try:
+                if obj is not None:
+                    obj.stop()
+            except Exception:
+                pass
+
     # ─── Low-level input helpers ───────────────────────────────────────────
 
     def _axis(self, idx):
@@ -640,6 +747,7 @@ class PS2TeleopVizNode:
             self._run_inner()
         finally:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
+            self._shutdown_recording()
 
     def _run_inner(self):
         """Main startup + control loop."""
@@ -737,7 +845,8 @@ class PS2TeleopVizNode:
         print("  [Y]               → toggle gripper open/close")
         print("  [Start]           → return to HOME (safe)")
         print("  [Select]          → re-anchor IK at current pos")
-        print("  keyboard 'r'      → same as Start")
+        print("  keyboard 'h'      → return to HOME (same as Start)")
+        print("  keyboard r/f/d    → record / finish+save / discard episode")
         print("="*62 + "\n")
 
         dt   = min(1.0 / self.control_rate, 0.05)   # cap dt to avoid huge jumps after lag
@@ -749,11 +858,11 @@ class PS2TeleopVizNode:
         while not rospy.is_shutdown():
             pygame.event.pump()
 
-            # ── Keyboard 'r' → HOME ───────────────────────────────────────
+            # ── Keyboard: h=HOME  r=record  f=finish+save  d=discard ──────
             if select.select([sys.stdin], [], [], 0)[0]:
-                key = sys.stdin.read(1)
-                if key.lower() == 'r':
-                    rospy.loginfo("[ctrl] 'r' — returning to HOME")
+                key = sys.stdin.read(1).lower()
+                if key == 'h':
+                    rospy.loginfo("[ctrl] 'h' — returning to HOME")
                     self._move_to_home()
                     actual = self._limb.joint_angles()
                     al = [actual.get(n, self.HOME_CONFIG[i]) for i, n in enumerate(JOINT_NAMES)]
@@ -763,6 +872,8 @@ class PS2TeleopVizNode:
                     self._cmd_angles       = al
                     self._last_sent_angles = al
                     self.rik.reset(al)
+                elif key in ('r', 'f', 'd'):
+                    self._handle_record_key(key)
 
             # ── [Start] → HOME ────────────────────────────────────────────
             if self._btn_pressed(BTN_START):
