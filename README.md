@@ -30,7 +30,7 @@ The teleop needs the RelaxedIK solver and (optionally) the Robotiq gripper drive
 
 ```bash
 export REPO_PATH=$HOME/ps2_sawyer_ws
-git clone https://github.com/EvaEkhteyary/Sawyer_teleop_with_ps2-controller.git $REPO_PATH
+git clone https://github.com/dqhuangnus/Sawyer_teleop_with_ps2-controller.git $REPO_PATH
 cd $REPO_PATH
 ```
 
