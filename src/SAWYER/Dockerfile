@@ -36,6 +36,7 @@ RUN apt-get update && apt-get install -y \
     ros-noetic-gazebo-msgs \
     ros-noetic-joint-state-publisher \
     python3-opencv \
+    libfuse2 \
     && rm -rf /var/lib/apt/lists/*
 
 # focal's stock pip (20.0.2) doesn't understand the manylinux_2_28 tag on the
