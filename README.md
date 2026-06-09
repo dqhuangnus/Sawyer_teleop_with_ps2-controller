@@ -42,7 +42,7 @@ Sawyer MoveIt + pygame:
 ```bash
 docker build -t sawyer_ps2controller:latest -f src/SAWYER/Dockerfile .
 ```
-#### step 2.5 (only if
+#### step 2.5 (only if permission denied)
 If this gives a **permission denied** error when running docker commands, add your user to
 the docker group:
 
@@ -89,8 +89,6 @@ cd /root/catkin_ws
 nano intera.sh
 source devel/setup.bash
 source intera.sh
-roscore
-
 ```
 
 Test ROS comms:
@@ -170,4 +168,3 @@ sudo docker exec -it <container_name> bash
 ### `[ctrl] No joystick detected!`
 - Plug the gamepad in **before** starting the container.
 - Confirm the host sees it: `ls /dev/input/js0` should exist.
-
