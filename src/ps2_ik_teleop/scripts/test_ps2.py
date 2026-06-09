@@ -433,7 +433,7 @@ class PS2TeleopVizNode:
         self.camera_ips       = rospy.get_param('~camera_ips', {
             'image_left':  '192.168.1.130',
             'image_right': '192.168.1.120',
-            'image_top':   '192.168.1.100'})
+            'image_top':   '192.168.1.131'})
         self.cam_scale        = rospy.get_param('~camera_scale',   0.5)
         self.cam_binning      = rospy.get_param('~camera_binning', 2)
         self.cam_fps          = rospy.get_param('~camera_fps',     10)
