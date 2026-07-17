@@ -1,68 +1,94 @@
-"""Intel RealSense (color + aligned depth) with a background latest-frame cache.
+"""Intel RealSense (color + aligned depth) via the realsense2_camera ROS driver.
 
-Mirrors the BaslerCameraManager API (start_bg / get_color / get_depth / stop)
-so the recorder treats every camera the same way. Depth is aligned to the
-color stream, so colour pixel (u,v) and depth pixel (u,v) correspond.
+The camera is NOT opened here — it is driven as a separate ROS node, started
+before the teleop with:
+
+    roslaunch realsense2_camera rs_camera.launch align_depth:=true
+
+`align_depth:=true` is what publishes /camera/aligned_depth_to_color/image_raw,
+so colour pixel (u,v) and depth pixel (u,v) correspond. Without it that topic
+never appears and only colour is recorded.
+
+This class just subscribes and caches the latest frame, exposing the same
+start_bg / get_color / get_depth / stop API as BaslerCameraManager, so the
+recorder treats every camera the same way.
 
 Color: (HEIGHT, WIDTH, 3) uint8 BGR
 Depth: (HEIGHT, WIDTH)    uint16 millimetres
 """
 
 import threading
-import time
 
 import numpy as np
 
 
+COLOR_TOPIC = "/camera/color/image_raw"
+DEPTH_TOPIC = "/camera/aligned_depth_to_color/image_raw"
+
+
 class RealSenseCamera:
-    def __init__(self, width=640, height=480, fps=30):
-        import pyrealsense2 as rs  # lazy import
-        self._rs = rs
-        self.width = int(width)
-        self.height = int(height)
-        self.fps = int(fps)
-        self._pipe = None
-        self._align = None
+    def __init__(self, color_topic=COLOR_TOPIC, depth_topic=DEPTH_TOPIC,
+                 wait_timeout=5.0):
+        self.color_topic = color_topic
+        self.depth_topic = depth_topic
+        self.wait_timeout = float(wait_timeout)
         self._color = None
         self._depth = None
+        # capture times from the driver's message headers (not arrival time),
+        # so recorded frames can be checked against the control-step timestamp
+        self._color_ts = 0.0
+        self._depth_ts = 0.0
         self._lock = threading.Lock()
-        self._running = False
-
-    def _open(self):
-        rs = self._rs
-        pipe = rs.pipeline()
-        cfg = rs.config()
-        cfg.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
-        cfg.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
-        pipe.start(cfg)
-        for _ in range(5):          # warm up — first frames are unreliable
-            pipe.wait_for_frames()
-        self._pipe = pipe
-        self._align = rs.align(rs.stream.color)
-        print("[realsense] streaming %dx%d @ %dfps (color+depth aligned)"
-              % (self.width, self.height, self.fps))
+        self._subs = []
 
     def start_bg(self):
-        self._open()
-        self._running = True
-        threading.Thread(target=self._loop, daemon=True).start()
+        """Subscribe to the driver's topics. Raises if the driver isn't up."""
+        import rospy
+        from sensor_msgs.msg import Image
+        from cv_bridge import CvBridge
 
-    def _loop(self):
-        while self._running:
-            try:
-                fs = self._pipe.wait_for_frames(5000)
-                fs = self._align.process(fs)
-                c = fs.get_color_frame()
-                d = fs.get_depth_frame()
-                if not c or not d:
-                    continue
-                color = np.asanyarray(c.get_data())
-                depth = np.asanyarray(d.get_data())
-                with self._lock:
-                    self._color = color
-                    self._depth = depth
-            except Exception:
-                time.sleep(0.05)
+        self._bridge = CvBridge()
+        # Fail loudly here rather than silently recording all-zero frames: if
+        # rs_camera.launch was never started, the topic never arrives.
+        try:
+            rospy.wait_for_message(self.color_topic, Image, timeout=self.wait_timeout)
+        except Exception:
+            raise RuntimeError(
+                "no message on %s after %.1fs — is the driver running?\n"
+                "    roslaunch realsense2_camera rs_camera.launch align_depth:=true"
+                % (self.color_topic, self.wait_timeout))
+
+        self._subs = [
+            rospy.Subscriber(self.color_topic, Image, self._on_color, queue_size=1),
+            rospy.Subscriber(self.depth_topic, Image, self._on_depth, queue_size=1),
+        ]
+
+        # Depth is optional-but-expected: warn instead of dying, so a colour-only
+        # session still records rather than aborting mid-setup.
+        try:
+            rospy.wait_for_message(self.depth_topic, Image, timeout=self.wait_timeout)
+        except Exception:
+            rospy.logwarn("[realsense] no %s — relaunch with align_depth:=true "
+                          "or depth will not be recorded", self.depth_topic)
+
+    def _on_color(self, msg):
+        try:
+            # driver publishes rgb8; ask cv_bridge for bgr8 to match Basler frames
+            img = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        except Exception:
+            return
+        with self._lock:
+            self._color = np.asarray(img)
+            self._color_ts = msg.header.stamp.to_sec()
+
+    def _on_depth(self, msg):
+        try:
+            img = self._bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+        except Exception:
+            return
+        with self._lock:
+            self._depth = np.asarray(img).astype(np.uint16)
+            self._depth_ts = msg.header.stamp.to_sec()
 
     def get_color(self):
         with self._lock:
@@ -72,16 +98,24 @@ class RealSenseCamera:
         with self._lock:
             return self._depth.copy() if self._depth is not None else None
 
+    def get_color_with_ts(self):
+        with self._lock:
+            return (self._color.copy() if self._color is not None else None,
+                    self._color_ts)
+
+    def get_depth_with_ts(self):
+        with self._lock:
+            return (self._depth.copy() if self._depth is not None else None,
+                    self._depth_ts)
+
     def has_data(self):
         with self._lock:
             return self._color is not None
 
     def stop(self):
-        self._running = False
-        if self._pipe is not None:
+        for s in self._subs:
             try:
-                self._pipe.stop()
+                s.unregister()
             except Exception:
                 pass
-            self._pipe = None
-            self._align = None
+        self._subs = []

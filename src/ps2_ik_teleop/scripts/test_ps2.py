@@ -426,18 +426,27 @@ class PS2TeleopVizNode:
         # ── Data collection (Basler ×3 + uSkin tactile) ───────────────────
         self.record_enabled   = rospy.get_param('~record_enabled', True)
         self.record_rate      = rospy.get_param('~record_rate', 20.0)
+        # tactile is sampled faster than the control rate; the ratio is the
+        # tactile history_len (100/20 = 5) — see data_recorder docstring.
+        self.tactile_rate     = rospy.get_param('~tactile_rate', 100.0)
         self.save_dir         = rospy.get_param('~save_dir', '/root/collected_data')
         self.xela_ws_url      = rospy.get_param('~xela_ws_url', 'ws://localhost:5000')
         self.n_taxels         = rospy.get_param('~tactile_taxels', 24)
         self.tac_hist         = rospy.get_param('~tactile_history', 5)
         self.camera_ips       = rospy.get_param('~camera_ips', {
-            'image_left':  '192.168.1.130',
-            'image_right': '192.168.1.120',
-            'image_top':   '192.168.1.131'})
+            'image_left':  '192.168.1.200',
+            'image_right': '192.168.1.210',
+            'image_top':   '192.168.1.220'})
         self.cam_scale        = rospy.get_param('~camera_scale',   0.5)
         self.cam_binning      = rospy.get_param('~camera_binning', 2)
         self.cam_fps          = rospy.get_param('~camera_fps',     10)
-        self.record_realsense = rospy.get_param('~record_realsense', False)
+        # RealSense is driven by the realsense2_camera ROS node (started
+        # separately); resolution/fps are set there, we only pick the topics.
+        self.record_realsense = rospy.get_param('~record_realsense', True)
+        self.rs_color_topic   = rospy.get_param('~realsense_color_topic',
+                                                '/camera/color/image_raw')
+        self.rs_depth_topic   = rospy.get_param('~realsense_depth_topic',
+                                                '/camera/aligned_depth_to_color/image_raw')
 
         self.recorder  = None
         self.recording = False
@@ -457,9 +466,11 @@ class PS2TeleopVizNode:
         try:
             self.tactile = TactileReader(ws_url=self.xela_ws_url,
                                          n_per_finger=self.n_taxels,
-                                         history_len=self.tac_hist)
+                                         history_len=self.tac_hist,
+                                         nominal_hz=self.tactile_rate)
             self.tactile.start()
-            rospy.loginfo("[ctrl] Tactile reader started (%s)", self.xela_ws_url)
+            rospy.loginfo("[ctrl] Tactile reader started (%s @ %.0f Hz)",
+                          self.xela_ws_url, self.tactile_rate)
         except Exception as e:
             rospy.logwarn("[ctrl] Tactile unavailable: %s", e)
 
@@ -476,17 +487,20 @@ class PS2TeleopVizNode:
         if self.record_realsense:
             try:
                 from realsense_camera import RealSenseCamera
-                self.realsense = RealSenseCamera()
+                self.realsense = RealSenseCamera(color_topic=self.rs_color_topic,
+                                                 depth_topic=self.rs_depth_topic)
                 self.realsense.start_bg()
-                rospy.loginfo("[ctrl] RealSense started")
+                rospy.loginfo("[ctrl] RealSense subscribed (%s)", self.rs_color_topic)
             except Exception as e:
+                self.realsense = None
                 rospy.logwarn("[ctrl] RealSense unavailable: %s", e)
 
         gripper = self._gripper if getattr(self, '_gripper_ready', False) else None
         self.recorder = DataRecorder(
             limb=self._limb, gripper=gripper, tactile=self.tactile,
             basler=self.basler, realsense=self.realsense,
-            rate_hz=self.record_rate, save_dir=self.save_dir)
+            rate_hz=self.record_rate, tactile_hz=self.tactile_rate,
+            save_dir=self.save_dir)
         rospy.loginfo("[ctrl] Recorder ready -> %s  (r=record  f=finish+save  d=discard)",
                       self.save_dir)
 

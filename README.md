@@ -56,6 +56,7 @@ Once fixed, repeat **step 2** again.
 #### step 3: run the container
 
 The gamepad is passed through as `/dev/input/js0` — plug it in **before** starting the
+container. `/dev/bus/usb` is mounted so the RealSense camera enumerates inside the
 container.
 
 > RelaxedIK and `ps2_ik_teleop` are built into the image under `/root/catkin_ws`.
@@ -72,6 +73,7 @@ docker run -it \
   -e QT_X11_NO_MITSHM=1 \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
   -v /dev/input:/dev/input \
+  -v /dev/bus/usb:/dev/bus/usb \
   --device=/dev/input/js0 \
   -w /root/catkin_ws \
   sawyer_ps2controller:latest
@@ -129,23 +131,75 @@ the **tactile_act_real** format.
 |--------|--------------------|-----------|-----------|
 | Basler ×3 (GigE) | `pypylon` | by IP over `--net=host` | `image_left/right/top` (T,300,480,3) |
 | uSkin (2 fingers) | `websocket-client` → `xela_server` | SocketCAN → `ws://localhost:5000` | `tactile_1/2` (T,5,24,3) |
-| Intel RealSense *(off by default)* | `pyrealsense2` (not installed yet) | USB | `image_realsense` + `depth_realsense` |
+| Intel RealSense | `ros-noetic-realsense2-camera` (apt) | USB → ROS topics | `image_realsense` (T,480,640,3) + `depth_realsense` (T,480,640) |
+
+Basler IPs default to `image_left` `192.168.1.200`, `image_right` `192.168.1.210`,
+`image_top` `192.168.1.220`.
 
 Plus `action_pos`, `action_quat`, `gripper`, `joint_state`, `timestamp`.
+
+### Rates and alignment
+
+Two clocks, locked together:
+
+| | rate | meaning |
+|---|---|---|
+| control / dataset | **20 Hz** | one HDF5 row per 50 ms step |
+| uSkin tactile | **100 Hz** | **5 sub-samples per row** → the `5` in `tactile_1/2` (T,**5**,24,3) |
+
+`~tactile_rate` must be an integer multiple of `~record_rate` — that multiple *is*
+the history dimension (100/20 = 5), so the two can't be changed independently
+without changing the dataset shape (the recorder raises if they don't divide).
+
+Each row is anchored to a nominal slot `t0 + k/20`, an exact grid that never drifts.
+Every source is referenced to that same slot: tactile is resampled onto the 100 Hz
+grid ending at the slot by **zero-order hold** (newest sample at-or-before each
+point — never interpolated forward from the future), and cameras contribute their
+latest frame *plus its capture time*. So one row = one instant, and you can **verify**
+that rather than trust it:
+
+| key | meaning |
+|---|---|
+| `timestamp` (T,) | nominal slot time — the exact 20 Hz grid |
+| `timestamp_read` (T,) | when the robot state was actually read |
+| `tactile_ts` (T,5) | arrival time of each tactile sub-sample |
+| `tactile_valid` (T,5) | `False` = zero-filled, no real data for that point |
+| `image_*_ts`, `depth_realsense_ts` (T,) | frame capture time → `timestamp - image_left_ts` is that frame's true lag |
+
+File attrs record `measured_rate_hz` (actual, not the requested one),
+`missed_steps` (sampling overran and slots were skipped) and `stale_steps`
+(some source was backfilled from cache). Backfilled frames are **counted**, not
+passed off as fresh — check these before trusting an episode.
 
 **One-time:** the XELA server is proprietary — put `xela_server` + `xServ.ini` under
 `external/Xela/` before building (it gets installed to `/usr/local/bin` + `/etc/xela`).
 Basler capture works without it.
 
-**Host prep for tactile** (uSkin is on the CAN bus):
+**Host prep for tactile** (uSkin is on the CAN bus) — run `setup.sh` on the **host**
+before starting the container. It resets `can0`, brings it up at 1 Mbps with
+auto-recovery, then sniffs 3 s of `candump` to confirm the sensor is actually talking:
 ```bash
-sudo ip link set can0 up type can bitrate 1000000
+./setup.sh
 ```
+It exits with an error if the INNO-MAKER adapter isn't plugged in (`lsusb` should show
+`1d50:606f`). RealSense is USB — `--privileged` + `-v /dev/bus/usb:/dev/bus/usb` in the
+`docker run` above is all it needs; no host prep.
 
 **Persist episodes to the host** — add to your `docker run`:
 ```bash
   -v $REPO_PATH/collected_data:/root/collected_data \
 ```
+
+**Start the RealSense driver** (own terminal — it's a separate ROS node):
+```bash
+docker exec -it sawyer_ps2 bash
+source /opt/ros/noetic/setup.bash
+roslaunch realsense2_camera rs_camera.launch align_depth:=true
+```
+`align_depth:=true` is **required**: it's what publishes
+`/camera/aligned_depth_to_color/image_raw`, so colour pixel (u,v) and depth pixel
+(u,v) correspond. The arg defaults to `false` — without it that topic never appears
+and only colour gets recorded (the node warns). Check with `rostopic hz`.
 
 **Collect** — in terminal 2 (the same container), start the tactile server first, then
 run the teleop as usual:
@@ -154,9 +208,13 @@ xela_server -f /etc/xela/xServ.ini --port 5000 --ip 0.0.0.0 &   # only needed fo
 python3 src/ps2_ik_teleop/scripts/test_ps2.py
 ```
 Keys while teleoperating: **r** start episode · **f** finish + save · **d** discard ·
-**h** return to HOME. Episodes land in `/root/collected_data/`. Camera IPs / rate are
-ROS params (`~camera_ips`, `~record_rate`); `~record_realsense` enables RealSense
-(after `pip install pyrealsense2`).
+**h** return to HOME. Episodes land in `/root/collected_data/`.
+
+ROS params: `~camera_ips` (Basler), `~record_rate` (20 Hz), `~tactile_rate` (100 Hz),
+`~save_dir`. RealSense records by default (`~record_realsense`); it subscribes to
+`~realsense_color_topic` / `~realsense_depth_topic` (resolution and fps are set by
+`rs_camera.launch`, not here). If the driver isn't running the node warns and records
+everything else rather than aborting.
 
 ## NOTE:
 

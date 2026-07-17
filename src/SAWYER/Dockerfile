@@ -49,7 +49,7 @@ RUN python3 -m pip install --upgrade pip
 #   pypylon          -> Basler GigE cameras (Basler cp38 wheel; rc not on PyPI)
 #   websocket-client -> uSkin tactile (xela_server @ ws://localhost:5000)
 #   h5py             -> episode recording   (cv2 from apt python3-opencv)
-# RealSense (pyrealsense2) intentionally not installed — capture off by default.
+# RealSense needs no pip package — it's the ROS driver from apt (step 1.4).
 RUN python3 -m pip install \
         "numpy==1.24.4" \
         "pyRobotiqGripper==1.0.1" \
@@ -57,6 +57,21 @@ RUN python3 -m pip install \
         "https://github.com/basler/pypylon/releases/download/2.0.0rc1/pypylon-2.0.0rc1-cp38-cp38-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl" \
         "websocket-client==1.8.0" \
         "h5py==3.11.0"
+
+# -----------------------------
+# 1.4 Intel RealSense (ROS driver)
+# -----------------------------
+# Everything comes from the ROS apt repo already configured in the base image —
+# no Intel repo needed (theirs ships a stale signing key and no python bindings).
+# The camera is driven as a ROS node, launched at runtime with:
+#     roslaunch realsense2_camera rs_camera.launch align_depth:=true
+# and the recorder subscribes to its topics. Runtime needs `--privileged` +
+# `-v /dev/bus/usb:/dev/bus/usb` for the camera to enumerate.
+RUN apt-get update && apt-get install -y \
+        ros-${ROS_DISTRO}-librealsense2 \
+        ros-${ROS_DISTRO}-realsense2-camera \
+        ros-${ROS_DISTRO}-realsense2-description \
+    && rm -rf /var/lib/apt/lists/*
 
 # -----------------------------
 # 1.5 Rust toolchain (to build RelaxedIK)

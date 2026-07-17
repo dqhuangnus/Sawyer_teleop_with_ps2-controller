@@ -29,17 +29,27 @@ class TactileReader:
 
     The server pushes JSON packets at ~100 Hz; keys "1" and "2" hold the two
     fingers, each with a "calibrated" flat list of n_taxels*3 floats (XYZ per
-    taxel). We keep the last `history_len` frames per finger.
+    taxel).
+
+    Every frame is stamped on arrival and kept in a time-ordered ring buffer
+    (`buffer_sec` of history). Callers ask for a window by TIME
+    (`history_at`), not by "last k frames" — the recorder's 20 Hz step must
+    line up with the 100 Hz tactile grid regardless of jitter, dropped
+    packets, or a server that briefly runs fast/slow.
     """
 
-    def __init__(self, ws_url="ws://localhost:5000", n_per_finger=24, history_len=5):
+    def __init__(self, ws_url="ws://localhost:5000", n_per_finger=24, history_len=5,
+                 buffer_sec=2.0, nominal_hz=100.0):
         import websocket  # lazy import — only needed when tactile is used
         self._websocket = websocket
         self.ws_url = ws_url
         self.n = int(n_per_finger)
         self.history_len = int(history_len)
-        self._buf = {1: deque(maxlen=self.history_len),
-                     2: deque(maxlen=self.history_len)}
+        self.nominal_hz = float(nominal_hz)
+        # ring buffer of (timestamp, array) — sized by time, not by history_len,
+        # so history_at() can look back across a whole control step.
+        maxlen = max(int(buffer_sec * self.nominal_hz), self.history_len * 4)
+        self._buf = {1: deque(maxlen=maxlen), 2: deque(maxlen=maxlen)}
         self._ts = 0.0
         self._lock = threading.Lock()
         self._running = False
@@ -70,30 +80,75 @@ class TactileReader:
                             pad = np.zeros((self.n, 3), dtype=np.float32)
                             pad[: arr.shape[0]] = arr
                             arr = pad
+                        now = time.time()
                         with self._lock:
-                            self._buf[sid].append(arr)
-                            self._ts = time.time()
+                            self._buf[sid].append((now, arr))
+                            self._ts = now
             except Exception:
                 if self._running:
                     time.sleep(0.5)  # connection lost — retry
 
-    def _window(self, sid):
-        """Return (history_len, n, 3); pads with the oldest frame if short,
-        zeros if the finger never reported."""
-        frames = list(self._buf[sid])
-        out = np.zeros((self.history_len, self.n, 3), dtype=np.float32)
+    def _window_at(self, sid, grid):
+        """Sample finger `sid` onto the explicit timestamp `grid`.
+
+        Zero-order hold: each grid point takes the newest frame at or before
+        it — the physically honest choice for a sensor we can only observe at
+        arrival times (never interpolate forward into the future).
+
+        Returns (data, stamps, valid):
+            data   (len(grid), n, 3) float32 — zeros where no frame applies
+            stamps (len(grid),)      float64 — arrival time of the frame used
+                                               (0.0 where invalid)
+            valid  (len(grid),)      bool    — False = zero-filled, no real data
+        """
+        k = len(grid)
+        data = np.zeros((k, self.n, 3), dtype=np.float32)
+        stamps = np.zeros(k, dtype=np.float64)
+        valid = np.zeros(k, dtype=bool)
+        frames = self._buf[sid]
         if not frames:
-            return out
-        while len(frames) < self.history_len:
-            frames.insert(0, frames[0])
-        for i, f in enumerate(frames[-self.history_len:]):
-            out[i] = f
-        return out
+            return data, stamps, valid
+
+        # frames are append-only in time order, so one backward scan fills the
+        # whole grid — no per-point search.
+        j = len(frames) - 1
+        for i in range(k - 1, -1, -1):
+            t = grid[i]
+            while j >= 0 and frames[j][0] > t:
+                j -= 1
+            if j < 0:
+                break                      # grid point predates all buffered data
+            ts, arr = frames[j]
+            data[i] = arr
+            stamps[i] = ts
+            valid[i] = True
+        return data, stamps, valid
+
+    def history_at(self, t_end, n=None, dt=None):
+        """Window of `n` samples on a `dt`-spaced grid ending at `t_end`.
+
+        Defaults reproduce the tactile-ACT layout: 5 samples at 100 Hz, i.e.
+        the 50 ms immediately preceding t_end — exactly one 20 Hz control step.
+
+        Returns (tac1, tac2, stamps, valid) where tac* are (n, n_taxels, 3).
+        """
+        n = int(n or self.history_len)
+        dt = float(dt or (1.0 / self.nominal_hz))
+        # oldest -> newest, last point == t_end
+        grid = [t_end - (n - 1 - i) * dt for i in range(n)]
+        with self._lock:
+            d1, s1, v1 = self._window_at(1, grid)
+            d2, s2, v2 = self._window_at(2, grid)
+        # one stamp per grid point: fingers share the grid, so report the
+        # newest arrival backing each point, and call a point valid only if
+        # at least one finger actually had data for it.
+        stamps = np.maximum(s1, s2)
+        return d1, d2, stamps, (v1 | v2)
 
     def get_history(self):
-        """Return (tactile_1, tactile_2), each (history_len, n_taxels, 3)."""
-        with self._lock:
-            return self._window(1), self._window(2)
+        """Window ending 'now'. Kept for callers that don't track a slot time."""
+        t1, t2, _, _ = self.history_at(time.time())
+        return t1, t2
 
     def force_sum(self):
         """Sum of |F| across both fingers' latest frame (live UI helper)."""
@@ -101,8 +156,28 @@ class TactileReader:
             total = 0.0
             for sid in (1, 2):
                 if self._buf[sid]:
-                    total += float(np.linalg.norm(self._buf[sid][-1], axis=-1).sum())
+                    total += float(np.linalg.norm(self._buf[sid][-1][1], axis=-1).sum())
             return total
+
+    def rate_hz(self):
+        """Measured arrival rate over the buffer (0.0 if too few frames).
+
+        Lets the recorder verify the server really is at ~nominal_hz instead of
+        assuming it.
+        """
+        with self._lock:
+            for sid in (1, 2):
+                b = self._buf[sid]
+                if len(b) >= 2:
+                    span = b[-1][0] - b[0][0]
+                    if span > 0:
+                        return (len(b) - 1) / span
+            return 0.0
+
+    def age(self):
+        """Seconds since the last packet (inf if nothing ever arrived)."""
+        with self._lock:
+            return (time.time() - self._ts) if self._ts else float("inf")
 
     def has_data(self):
         with self._lock:
@@ -133,6 +208,7 @@ class BaslerCameraManager:
         self.binning = int(binning)
         self.cameras = {}
         self.latest = {}
+        self.latest_ts = {}      # name -> time.time() when the frame was converted
         self.converter = pylon.ImageFormatConverter()
         self.converter.OutputPixelFormat = pylon.PixelType_BGR8packed
         tlf = pylon.TlFactory.GetInstance()
@@ -177,6 +253,7 @@ class BaslerCameraManager:
                 cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
                 self.cameras[name] = cam
                 self.latest[name] = None
+                self.latest_ts[name] = 0.0
                 print("[camera] %s (%s) open: binning=%d packet=%d"
                       % (name, ip, self.binning, packet_size))
             except Exception as e:
@@ -197,6 +274,7 @@ class BaslerCameraManager:
                         img = cv2.resize(img, (int(w * self.scale), int(h * self.scale)),
                                          interpolation=cv2.INTER_AREA)
                     self.latest[name] = img
+                    self.latest_ts[name] = time.time()
                 if grab:
                     grab.Release()
             except Exception:
@@ -213,6 +291,12 @@ class BaslerCameraManager:
     def get(self, name):
         img = self.latest.get(name)
         return img.copy() if img is not None else None
+
+    def get_with_ts(self, name):
+        """(frame, capture_time) — capture_time 0.0 if never grabbed."""
+        img = self.latest.get(name)
+        return (img.copy() if img is not None else None,
+                float(self.latest_ts.get(name, 0.0)))
 
     @property
     def names(self):
